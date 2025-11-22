@@ -9,6 +9,7 @@ import streamlit as st
 import requests
 import time
 import yfinance as yf  # if you're using it directly anywhere
+import os
 
 # --- Auth & API config from secrets or env ---
 APP_USERNAME = st.secrets.get("APP_USERNAME", os.getenv("APP_USERNAME", "hari"))
@@ -19,21 +20,23 @@ ALPHAVANTAGE_API_KEY_DEFAULT = st.secrets.get(
 )
 
 def login_gate():
-    # set_page_config MUST be called once at top level; keep it here
+    # Page setup (must be called once)
     st.set_page_config(page_title="Dip Strategy Dashboard", layout="wide")
 
-    # Add logout button if already authenticated
-    if st.session_state.get("auth", False):
+    # Initialize auth flag if missing
+    if "auth" not in st.session_state:
+        st.session_state.auth = False
+
+    # If already authenticated, show only a Logout button in sidebar and return
+    if st.session_state.auth:
         with st.sidebar:
             if st.button("🔐 Logout"):
                 st.session_state.clear()
                 st.experimental_rerun()
-
-    # If already authenticated, just return and let app run
-    if st.session_state.get("auth", False):
+        # ✅ Important: DO NOT show any title here
         return
 
-    # Otherwise, show login screen and block rest of app
+    # 🔒 Not authenticated → show login screen
     st.title("📉📈 Dip Strategy Trading Dashboard – Login")
 
     user = st.text_input("Username")
@@ -47,21 +50,12 @@ def login_gate():
         else:
             st.error("Invalid username or password.")
 
-    # If not authenticated, stop the script here
-    if not st.session_state.get("auth", False):
+    # Block the rest of the app if still not logged in
+    if not st.session_state.auth:
         st.stop()
 
-# 🔒 Call login gate BEFORE any other UI
-login_gate()
-
-# 👇 Everything below this line is your existing app (tabs, portfolio, etc.)
-st.title("📉📈 Dip Strategy Trading Dashboard")
-st.caption("Dynamic universe · Dip-buy strategy · Yahoo for daily signals + on-demand Alpha Vantage comparison")
 
 # ... rest of your app code (sidebar, portfolio_summary, tabs, etc.)
-
-
-
 try:
     import yfinance as yf
 except ImportError:
