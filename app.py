@@ -1,3 +1,4 @@
+import os
 import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, List
@@ -7,12 +8,58 @@ import pandas as pd
 import streamlit as st
 import requests
 import time
-import os
+import yfinance as yf  # if you're using it directly anywhere
 
 # --- Auth & API config from secrets or env ---
 APP_USERNAME = st.secrets.get("APP_USERNAME", os.getenv("APP_USERNAME", "hari"))
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "mysecret"))
-ALPHAVANTAGE_API_KEY_DEFAULT = st.secrets.get("ALPHAVANTAGE_API_KEY", os.getenv("ALPHAVANTAGE_API_KEY", "YOUR_LOCAL_KEY_HERE"))
+ALPHAVANTAGE_API_KEY_DEFAULT = st.secrets.get(
+    "ALPHAVANTAGE_API_KEY",
+    os.getenv("ALPHAVANTAGE_API_KEY", "XYW7EDBAM10QN35M")
+)
+
+def login_gate():
+    # set_page_config MUST be called once at top level; keep it here
+    st.set_page_config(page_title="Dip Strategy Dashboard", layout="wide")
+
+    # Add logout button if already authenticated
+    if st.session_state.get("auth", False):
+        with st.sidebar:
+            if st.button("🔐 Logout"):
+                st.session_state.clear()
+                st.experimental_rerun()
+
+    # If already authenticated, just return and let app run
+    if st.session_state.get("auth", False):
+        return
+
+    # Otherwise, show login screen and block rest of app
+    st.title("📉📈 Dip Strategy Trading Dashboard – Login")
+
+    user = st.text_input("Username")
+    pwd = st.text_input("Password", type="password")
+    login_btn = st.button("Login")
+
+    if login_btn:
+        if user == APP_USERNAME and pwd == APP_PASSWORD:
+            st.session_state.auth = True
+            st.experimental_rerun()
+        else:
+            st.error("Invalid username or password.")
+
+    # If not authenticated, stop the script here
+    if not st.session_state.get("auth", False):
+        st.stop()
+
+# 🔒 Call login gate BEFORE any other UI
+login_gate()
+
+# 👇 Everything below this line is your existing app (tabs, portfolio, etc.)
+st.title("📉📈 Dip Strategy Trading Dashboard")
+st.caption("Dynamic universe · Dip-buy strategy · Yahoo for daily signals + on-demand Alpha Vantage comparison")
+
+# ... rest of your app code (sidebar, portfolio_summary, tabs, etc.)
+
 
 
 try:
