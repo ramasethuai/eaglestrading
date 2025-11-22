@@ -1,0 +1,3 @@
+Welcome to Alpha Vantage! Your API key is: XYW7EDBAM10QN35M. Please record this API key at a safe place for future data access
+
+got this key with ramasethuai@gmail.com email
