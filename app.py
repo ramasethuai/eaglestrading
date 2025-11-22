@@ -8,8 +8,8 @@ import pandas as pd
 import streamlit as st
 import requests
 import time
-import yfinance as yf  # if you're using it directly anywhere
-import os
+import yfinance as yf  # we import it once here
+
 
 # --- Auth & API config from secrets or env ---
 APP_USERNAME = st.secrets.get("APP_USERNAME", os.getenv("APP_USERNAME", "hari"))
@@ -20,8 +20,10 @@ ALPHAVANTAGE_API_KEY_DEFAULT = st.secrets.get(
 )
 
 def login_gate():
-    # Page setup (must be called once)
-    st.set_page_config(page_title="Dip Strategy Dashboard", layout="wide")
+    # set_page_config MUST be called before any other UI, but only once
+    if "page_config_set" not in st.session_state:
+        st.set_page_config(page_title="Dip Strategy Dashboard", layout="wide")
+        st.session_state.page_config_set = True
 
     # Initialize auth flag if missing
     if "auth" not in st.session_state:
@@ -33,8 +35,7 @@ def login_gate():
             if st.button("🔐 Logout"):
                 st.session_state.clear()
                 st.experimental_rerun()
-        # ✅ Important: DO NOT show any title here
-        return
+        return  # ✅ do NOT show login form when already logged in
 
     # 🔒 Not authenticated → show login screen
     st.title("📉📈 Dip Strategy Trading Dashboard – Login")
@@ -55,18 +56,14 @@ def login_gate():
         st.stop()
 
 
-# ... rest of your app code (sidebar, portfolio_summary, tabs, etc.)
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-    st.error("yfinance is not installed. Run `pip install yfinance`.")
+# 🔒 Call login gate BEFORE any other UI or config that draws things on the page
+login_gate()
 
+# From here down is your existing app: config, portfolio, tabs, etc.
 
 # =========================
 # CONFIG
 # =========================
-
 # Default starting universe (only used if tickers.csv not found)
 DEFAULT_TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "ADBE",
