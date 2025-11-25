@@ -1,3 +1,4 @@
+import os
 import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, List
@@ -7,25 +8,62 @@ import pandas as pd
 import streamlit as st
 import requests
 import time
-import os
+import yfinance as yf  # we import it once here
+
 
 # --- Auth & API config from secrets or env ---
 APP_USERNAME = st.secrets.get("APP_USERNAME", os.getenv("APP_USERNAME", "hari"))
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "mysecret"))
-ALPHAVANTAGE_API_KEY_DEFAULT = st.secrets.get("ALPHAVANTAGE_API_KEY", os.getenv("ALPHAVANTAGE_API_KEY", "YOUR_LOCAL_KEY_HERE"))
+ALPHAVANTAGE_API_KEY_DEFAULT = st.secrets.get(
+    "ALPHAVANTAGE_API_KEY",
+    os.getenv("ALPHAVANTAGE_API_KEY", "XYW7EDBAM10QN35M")
+)
+
+def login_gate():
+    # set_page_config MUST be called before any other UI, but only once
+    if "page_config_set" not in st.session_state:
+        st.set_page_config(page_title="Dip Strategy Dashboard", layout="wide")
+        st.session_state.page_config_set = True
+
+    # Initialize auth flag if missing
+    if "auth" not in st.session_state:
+        st.session_state.auth = False
+
+    # If already authenticated, show only a Logout button in sidebar and return
+    if st.session_state.auth:
+        with st.sidebar:
+            if st.button("🔐 Logout"):
+                st.session_state.clear()
+                st.experimental_rerun()
+        return  # ✅ do NOT show login form when already logged in
+
+    # 🔒 Not authenticated → show login screen
+    st.title("📉📈 Dip Strategy Trading Dashboard – Login")
+
+    user = st.text_input("Username")
+    pwd = st.text_input("Password", type="password")
+    login_btn = st.button("Login")
+
+    if login_btn:
+        if user == APP_USERNAME and pwd == APP_PASSWORD:
+            st.session_state.auth = True
+            st.experimental_rerun()
+        else:
+            st.error("Invalid username or password.")
+
+    # Block the rest of the app if still not logged in
+    if not st.session_state.auth:
+        st.stop()
 
 
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-    st.error("yfinance is not installed. Run `pip install yfinance`.")
+# 🔒 Call login gate BEFORE any other UI or config that draws things on the page
+login_gate()
 
+# From here down is your existing app: config, portfolio, tabs, etc.
 
 # =========================
 # CONFIG
 # =========================
-
 # Default starting universe (only used if tickers.csv not found)
 DEFAULT_TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "ADBE",
