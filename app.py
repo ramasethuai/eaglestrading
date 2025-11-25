@@ -34,7 +34,7 @@ def login_gate():
         with st.sidebar:
             if st.button("🔐 Logout"):
                 st.session_state.clear()
-                st.experimental_rerun()
+                st.rerun()
         return  # ✅ do NOT show login form when already logged in
 
     # 🔒 Not authenticated → show login screen
@@ -47,7 +47,7 @@ def login_gate():
     if login_btn:
         if user == APP_USERNAME and pwd == APP_PASSWORD:
             st.session_state.auth = True
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Invalid username or password.")
 

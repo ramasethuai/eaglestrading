@@ -6,3 +6,4 @@ got this key with ramasethuai@gmail.com email
 APP url: https://ramasethuai-eaglestrading-app-yzqulv.streamlit.app/
 credentials:
 harifutures/Eaglestrading
+hari/mysecret
