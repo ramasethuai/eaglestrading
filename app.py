@@ -32,6 +32,24 @@ DEFAULT_TICKERS = [
     "BRK-B", "JNJ", "PG", "PEP", "COST", "HD", "WMT", "V", "MA", "MCD", "XOM", "JPM"
 ]
 
+# Broader universe for daily screener (you can edit this list anytime)
+SCREENER_TICKERS = [
+    # Large-cap tech & growth
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "ADBE", "TSLA",
+    "NFLX", "CRM", "INTC", "CSCO", "ORCL", "AMD", "SHOP", "UBER", "NOW", "PANW",
+    # Consumer / retail
+    "COST", "WMT", "HD", "LOW", "MCD", "SBUX", "NKE", "TGT",
+    # Healthcare / pharma
+    "JNJ", "PFE", "MRK", "ABBV", "LLY", "UNH",
+    # Financials
+    "BRK-B", "JPM", "BAC", "WFC", "GS", "MS", "BX", "V", "MA", "AXP", "PYPL",
+    # Industrials / others
+    "CAT", "DE", "UPS", "FDX", "LMT", "BA", "IBM", "GE", "HON",
+    # Energy / utilities / staples
+    "XOM", "CVX", "COP", "NEE", "DUK", "PG", "PEP", "KO", "PM", "MO"
+]
+
+
 TICKERS_FILE = "tickers.csv"
 
 LOOKBACK_DAYS_UNIVERSE = 260   # days of data for signals
@@ -64,6 +82,20 @@ ALPHA_DAILY_CACHE: Dict[str, pd.DataFrame] = {}  # per-run cache
 # =========================
 # UNIVERSE (TICKERS) HELPERS
 # =========================
+
+SCREENER_FILE = "screener_tickers.csv"
+
+def load_screener_tickers():
+    try:
+        df = pd.read_csv(SCREENER_FILE)
+        return df["ticker"].astype(str).str.upper().tolist()
+    except:
+        return []
+
+def save_screener_tickers(ticker_list):
+    df = pd.DataFrame({"ticker": sorted(set(ticker_list))})
+    df.to_csv(SCREENER_FILE, index=False)
+
 
 def load_tickers() -> List[str]:
     """Load tickers from tickers.csv, or initialize with DEFAULT_TICKERS."""
@@ -173,6 +205,285 @@ def fetch_last_price_yf(symbol: str) -> float:
     df = yf_get_daily(symbol, LOOKBACK_DAYS_POSITIONS)
     close_col = "Close" if "Close" in df.columns else df.columns[-1]
     return float(df[close_col].iloc[-1])
+
+
+# =========================
+# SMART SCORING HELPERS
+# =========================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fundamentals_from_yahoo(ticker: str) -> dict:
+    """
+    Fetch basic fundamentals from Yahoo Finance via yfinance.
+    Cached for 1 hour to avoid repeated calls.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        return info
+    except Exception:
+        return {}
+
+
+def _safe_pct(val):
+    """Helper: safe convert ratios (0.15 -> 15%), ignore junk."""
+    try:
+        if val is None:
+            return None
+        return float(val) * 100.0
+    except Exception:
+        return None
+
+
+def compute_quality_score(ticker: str) -> float:
+    """
+    Q-Factor: business quality based on fundamentals.
+    Outputs 0–100.
+    Higher = better quality (growth, profitability, balance sheet).
+    """
+    info = get_fundamentals_from_yahoo(ticker)
+    if not info:
+        return 50.0  # neutral if no data
+
+    score = 0.0
+
+    # --- ROE ---
+    roe_pct = _safe_pct(info.get("returnOnEquity", None))
+    if roe_pct is not None:
+        if roe_pct >= 20:
+            score += 20
+        elif roe_pct >= 10:
+            score += 12
+        elif roe_pct >= 5:
+            score += 5
+        elif roe_pct < 0:
+            score -= 10  # sustained value destruction
+
+    # --- Profit margins ---
+    pm_pct = _safe_pct(info.get("profitMargins", None))
+    if pm_pct is not None:
+        if pm_pct >= 20:
+            score += 20
+        elif pm_pct >= 10:
+            score += 12
+        elif pm_pct >= 5:
+            score += 5
+        elif pm_pct < 0:
+            score -= 10
+
+    # --- Revenue growth (YoY) ---
+    rev_g_pct = _safe_pct(info.get("revenueGrowth", None))
+    if rev_g_pct is not None:
+        if rev_g_pct >= 20:
+            score += 15
+        elif rev_g_pct >= 10:
+            score += 10
+        elif rev_g_pct >= 3:
+            score += 5
+        elif rev_g_pct < 0:
+            score -= 5  # shrinking top line
+
+    # --- Debt-to-equity ---
+    dte = info.get("debtToEquity", None)
+    try:
+        dte = float(dte) if dte is not None else None
+    except Exception:
+        dte = None
+
+    if dte is not None:
+        if dte < 50:
+            score += 15
+        elif dte < 100:
+            score += 10
+        elif dte < 200:
+            score += 5
+        elif dte >= 300:
+            score -= 10  # highly leveraged
+
+    # --- Free cash flow ---
+    fcf = info.get("freeCashflow", None)
+    try:
+        fcf = float(fcf) if fcf is not None else None
+    except Exception:
+        fcf = None
+
+    if fcf is not None:
+        if fcf > 0:
+            score += 10
+        else:
+            score -= 5
+
+    # Clamp to [0, 100] and nudge towards center if no strong signals
+    score = max(0.0, min(100.0, score))
+    if score == 0.0 or score == 100.0:
+        # avoid extreme 0 or 100 due to missing data quirks
+        score = max(20.0, min(80.0, score))
+    return score
+
+
+def compute_momentum_score(df: pd.DataFrame) -> float:
+    """
+    Momentum: trend strength based on returns & EMA structure.
+    0–100 score.
+    """
+    if df is None or df.empty:
+        return 50.0
+
+    try:
+        price = df["close"].dropna()
+    except KeyError:
+        return 50.0
+
+    if len(price) < 200:
+        return 50.0  # not enough history
+
+    latest = price.iloc[-1]
+
+    def ret_for(days):
+        if len(price) <= days:
+            return 0.0
+        past = price.iloc[-days]
+        if past <= 0:
+            return 0.0
+        return (latest / past - 1.0) * 100.0
+
+    r1 = ret_for(21)   # ~1 month
+    r3 = ret_for(63)   # ~3 months
+    r6 = ret_for(126)  # ~6 months
+
+    score = 0.0
+
+    # --- short-term (1M) ---
+    if r1 > 10:
+        score += 10
+    elif r1 > 3:
+        score += 6
+    elif r1 > 0:
+        score += 3
+    elif r1 < -10:
+        score -= 5
+
+    # --- medium-term (3M) ---
+    if r3 > 20:
+        score += 15
+    elif r3 > 5:
+        score += 10
+    elif r3 > 0:
+        score += 5
+    elif r3 < -15:
+        score -= 5
+
+    # --- longer-term (6M) ---
+    if r6 > 30:
+        score += 20
+    elif r6 > 10:
+        score += 12
+    elif r6 > 0:
+        score += 6
+    elif r6 < -20:
+        score -= 5
+
+    ema20 = price.ewm(span=20, adjust=False).mean()
+    ema50 = price.ewm(span=50, adjust=False).mean()
+    ema200 = price.ewm(span=200, adjust=False).mean()
+
+    # EMA stack
+    try:
+        if latest > ema20.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1]:
+            score += 25
+        elif latest > ema50.iloc[-1] > ema200.iloc[-1]:
+            score += 15
+        elif latest > ema200.iloc[-1]:
+            score += 8
+    except Exception:
+        pass
+
+    # EMA200 slope
+    slope = 0.0
+    try:
+        if len(ema200) >= 20 and ema200.iloc[-20] != 0:
+            slope = (ema200.iloc[-1] - ema200.iloc[-20]) / ema200.iloc[-20] * 100.0
+    except Exception:
+        slope = 0.0
+
+    if slope > 5:
+        score += 15
+    elif slope > 1:
+        score += 10
+    elif slope > 0:
+        score += 5
+    elif slope < -2:
+        score -= 10
+
+    score = max(0.0, min(100.0, score))
+    if score == 0.0:
+        score = 30.0  # avoid extreme zero unless it's really terrible
+    return score
+
+
+def compute_dip_score(row: pd.Series) -> float:
+    """
+    Dip Score: how attractive the current pullback is.
+    Uses % from 21D high, RSI, and relation to EMA200 + your Signal.
+    0–100 score.
+    """
+    pct_from_high = row.get("% From 21D High", np.nan)
+    rsi = row.get("RSI", np.nan)
+    price = row.get("Price", np.nan)
+    ema200 = row.get("EMA200", np.nan)
+    signal = row.get("Signal", "-")
+
+    score = 0.0
+
+    # --- depth of dip ---
+    if not np.isnan(pct_from_high):
+        # only reward dips, not rallies
+        if pct_from_high <= -20:
+            score += 35
+        elif -20 < pct_from_high <= -10:
+            score += 30
+        elif -10 < pct_from_high <= -5:
+            score += 20
+        elif -5 < pct_from_high <= -3:
+            score += 10
+        # Above -3% we don't add anything (not a real dip)
+
+    # --- RSI oversold / neutral ---
+    if not np.isnan(rsi):
+        if 20 <= rsi <= 35:
+            score += 25
+        elif 35 < rsi <= 45:
+            score += 15
+        elif 45 < rsi <= 55:
+            score += 5
+        # RSI < 20 might be panic / catching a falling knife: small extra
+        if rsi < 20:
+            score += 5
+
+    # --- relation to EMA200 ---
+    if not (np.isnan(price) or np.isnan(ema200)):
+        if price > ema200:
+            score += 20    # pullback in uptrend
+        else:
+            score -= 5     # pullback below long-term trend – more caution
+
+    # --- integrate your rule engine's Signal ---
+    if signal == "BUY":
+        score += 15
+    elif signal == "WATCH":
+        score += 5
+
+    score = max(0.0, min(100.0, score))
+    return score
+
+def get_sector(ticker: str) -> str:
+    """
+    Get sector name for a ticker from Yahoo fundamentals.
+    Uses the same cached fundamentals as QScore.
+    """
+    info = get_fundamentals_from_yahoo(ticker)
+    sector = info.get("sector") or "Unknown"
+    return str(sector)
 
 
 # =========================
@@ -625,6 +936,7 @@ st.caption("Dynamic universe · Dip-buy strategy · Yahoo for daily signals + on
 
 # ---- Load current universe (tickers) ----
 tickers = load_tickers()
+screener_tickers = load_screener_tickers()
 
 # Sidebar: strategy + capital + AV key + ticker management + usage note
 st.sidebar.header("Strategy Settings")
@@ -691,6 +1003,37 @@ st.sidebar.code(OPEN_POSITIONS_FILE)
 st.sidebar.code(CLOSED_POSITIONS_FILE)
 st.sidebar.code(TICKERS_FILE)
 
+st.sidebar.markdown("---")
+st.sidebar.header("Market Screener Universe")
+
+# Show current screener universe
+st.sidebar.write(f"Total screener tickers: {len(screener_tickers)}")
+
+# Add new screener ticker
+with st.sidebar.form("add_screener_ticker_form"):
+    new_s_ticker = st.text_input("Add ticker to Screener", "").upper()
+    add_s_t = st.form_submit_button("➕ Add")
+
+    if add_s_t:
+        if new_s_ticker and new_s_ticker not in screener_tickers:
+            screener_tickers.append(new_s_ticker)
+            save_screener_tickers(screener_tickers)
+            st.success(f"Added {new_s_ticker} to Market Screener")
+        else:
+            st.warning("Ticker already exists or empty.")
+
+# Remove tickers
+remove_s_tickers = st.sidebar.multiselect(
+    "Remove screener tickers",
+    options=screener_tickers
+)
+
+if st.sidebar.button("🗑 Remove Selected"):
+    screener_tickers = [t for t in screener_tickers if t not in remove_s_tickers]
+    save_screener_tickers(screener_tickers)
+    st.success("Removed selected tickers from screener universe.")
+
+
 
 # ---------- PORTFOLIO SUMMARY ----------
 summary = portfolio_summary(total_capital)
@@ -726,7 +1069,9 @@ with c4:
         help="Approx: entry_value × stop_loss_pct summed across open trades."
     )
 
-tab_signals, tab_open, tab_monitor = st.tabs(["🔍 Signals", "📒 Open Positions", "📊 Monitor / Close"])
+tab_signals, tab_screener, tab_open, tab_monitor = st.tabs(
+    ["🔍 Signals", "🔭 Market Screener", "📒 Open Positions", "📊 Monitor / Close"]
+)
 
 
 # ------------- TAB 1: SIGNALS (YAHOO + CAPITAL + AV COMPARE + BACKTEST) -------------
@@ -873,7 +1218,326 @@ with tab_signals:
         st.info("Click the button to run a one-click historical backtest summary.")
 
 
-# ------------- TAB 2: OPEN POSITIONS -------------
+# ------------- TAB 2: MARKET SCREENER (YAHOO · DYNAMIC TOP 50) -------------
+with tab_screener:
+    st.subheader("🔭 Market Screener – Top 50 Dip Candidates")
+
+        # Smart Score explanation in expanders
+    with st.expander("ℹ️ What are Smart Scores? (Q-Factor, Momentum, Dip, Final)", expanded=False):
+        st.markdown(
+            """
+            Smart Scores help you filter the **highest conviction dip opportunities**.  
+            A stock must pass your **dip rules** first (BUY/WATCH), and then it gets scored on:
+
+            ### **1️⃣ Q-Factor (Quality Score, 0–100)**
+            Measures *business strength*:
+            - ROE (Return on Equity), profit margins
+            - Revenue growth
+            - Debt levels, free cash flow
+
+            **High QScore → financially strong company.**
+
+            ### **2️⃣ Momentum Score (0–100)**
+            Measures **trend strength**:
+            - 1M, 3M, 6M price returns
+            - EMA20 / EMA50 / EMA200 alignment
+            - Long-term trend slope (EMA200)
+
+            **High Momentum → strong buyers in control.**
+
+            ### **3️⃣ Dip Score (0–100)**
+            Measures how attractive the **current pullback** is:
+            - % from 21D high (e.g. −5% to −20%)
+            - RSI oversold zone (20–40)
+            - Price above EMA200 (healthy uptrend)
+            - Extra boost if your rule engine says **BUY/WATCH**
+
+            **High DipScore → clean pullback inside a strong trend.**
+
+            ### **4️⃣ Final Smart Score (0–100)**
+            Weighted combination:
+
+            \t**FinalScore = 0.4 · Q + 0.3 · Momentum + 0.3 · Dip**
+
+            Meaning:
+            - 40% **business quality**
+            - 30% **trend strength**
+            - 30% **dip entry quality**
+
+            ### **Ratings**
+            - 🟢 **ELITE**: FinalScore ≥ 90  
+            - ✅ **STRONG BUY**: 80–89  
+            - 🟡 **WATCH**: 70–79  
+            - ⚪ **LOW**: < 70  
+            """
+        )
+
+    with st.expander("📘 Smart Score Examples", expanded=False):
+        st.markdown(
+            """
+            These are **illustrative examples** of how scores might look:
+
+            **NVDA (example strong growth stock):**
+            - Q = 95  (explosive growth + margins)  
+            - Momentum = 100 (massive uptrend)  
+            - Dip = 80 (nice pullback, still above EMA200)  
+            - Final = 0.4·95 + 0.3·100 + 0.3·80 = **92 → ELITE**
+
+            **AAPL (mild dip in a good company):**
+            - Q = 85  
+            - Momentum = 70  
+            - Dip = 40 (shallow pullback)  
+            - Final ≈ **69 → WATCH**
+
+            **TGT (lower quality dip):**
+            - Q = 55  
+            - Momentum = 40  
+            - Dip = 60 (nice dip, but weak business + trend)  
+            - Final ≈ **51 → LOW**
+
+            **How to Use This in Practice:**
+            1. Focus on **BUY** signals first.  
+            2. Filter for **FinalScore ≥ 70**.  
+            3. Prefer **STRONG BUY** and **ELITE** ideas.  
+            4. Use sector filter so you don’t over-load on one sector.  
+            5. Then move best names into **Your Universe** or trade them.
+            """
+        )
+
+    st.caption(
+        "Scans a broader large-cap universe (from screener_tickers.csv) using your dip strategy "
+        "and ranks ideas by Quality, Momentum, and Dip Score."
+    )
+
+    st.markdown(
+    """
+    **Rating Legend (Smart Score):**  
+    - 🟢 **ELITE**: FinalScore ≥ 90  
+    - ✅ **STRONG BUY**: 80–89  
+    - 🟡 **WATCH**: 70–79  
+    - ⚪ **LOW**: < 70 (usually filtered out by your slider)  
+    
+    **Tip:** Use the *Minimum Final Smart Score* slider to hide weaker ideas
+    and focus only on the highest conviction setups.
+    """
+    )
+
+    st.caption(
+        "Scans a broader large-cap universe (SCREENER_TICKERS) using the same dip strategy "
+        "and surfaces the top 50 candidates by depth of dip and RSI."
+    )
+
+    screener_limit = st.number_input("Max number of ideas to show", value=50, min_value=10, max_value=200, step=10)
+
+    # Minimum smart score filter
+    min_final_score = st.slider(
+        "Minimum Final Smart Score to display",
+        min_value=0,
+        max_value=100,
+        value=75,
+        step=5,
+        help="Filter out weaker ideas. Example: 75 = show only higher-conviction setups.",
+    )
+
+    if st.button("🚀 Run Daily Screener (Yahoo)"):
+        try:
+            screener_data = load_universe_data_yf(screener_tickers, LOOKBACK_DAYS_UNIVERSE)
+            signals = generate_signals(screener_data, dip_threshold, rsi_buy_max, ema_trend_filter)
+
+            if not signals:
+                st.info("No data available for screener universe.")
+            else:
+                rows = []
+                for s in signals:
+                    if s.action == "BUY":
+                        signal_rank = 2
+                    elif s.action == "WATCH":
+                        signal_rank = 1
+                    else:
+                        signal_rank = 0
+
+                    rows.append({
+                        "Ticker": s.ticker,
+                        "Price": s.close,
+                        "% From 21D High": s.pct_from_high,
+                        "RSI": s.rsi,
+                        "EMA200": s.ema200,
+                        "Signal": s.action,
+                        "SignalRank": signal_rank,
+                    })
+
+                df_all = pd.DataFrame(rows)
+
+                # ---- SMART SCORES: Q-Factor, Momentum, Dip, Final ----
+                q_scores = []
+                m_scores = []
+                d_scores = []
+                final_scores = []
+                sectors = []
+
+                for _, r in df_all.iterrows():
+                    t = r["Ticker"]
+                    df_price = screener_data.get(t, None)
+
+                    q = compute_quality_score(t)
+                    m = compute_momentum_score(df_price)
+                    d = compute_dip_score(r)
+                    final = 0.4 * q + 0.3 * m + 0.3 * d
+
+                    sector = get_sector(t)
+
+                    q_scores.append(q)
+                    m_scores.append(m)
+                    d_scores.append(d)
+                    final_scores.append(final)
+                    sectors.append(sector)
+
+                df_all["QScore"] = q_scores
+                df_all["MomentumScore"] = m_scores
+                df_all["DipScore"] = d_scores
+                df_all["FinalScore"] = final_scores
+                df_all["Sector"] = sectors  # 🆕 sector column
+
+                # Filter to BUY/WATCH
+                df_interest = df_all[df_all["SignalRank"] > 0].copy()
+
+                if df_interest.empty:
+                    st.info("No BUY/WATCH candidates in the screener universe under current rules.")
+                else:
+                    # 🎯 Sector filter (optional)
+                    sector_options = sorted(df_interest["Sector"].dropna().unique().tolist())
+                    selected_sectors = st.multiselect(
+                        "Filter by sector (optional)",
+                        options=sector_options,
+                        default=sector_options,
+                        help="Use this to avoid over-concentrating in a single sector.",
+                    )
+
+                    if selected_sectors:
+                        df_interest = df_interest[df_interest["Sector"].isin(selected_sectors)].copy()
+
+                    if df_interest.empty:
+                        st.info("No ideas remain after applying sector filter.")
+                    else:
+                        # 📉 Filter by requested minimum smart score
+                        df_interest = df_interest[df_interest["FinalScore"] >= min_final_score].copy()
+
+                        if df_interest.empty:
+                            st.info(
+                                f"No ideas with Final Smart Score ≥ {min_final_score} "
+                                f"for selected sector(s): {', '.join(selected_sectors)}."
+                            )
+                        else:
+                            # 🏷 Rating / Badge based on FinalScore
+                            def classify_rating(fs: float) -> str:
+                                if fs >= 90:
+                                    return "ELITE"
+                                elif fs >= 80:
+                                    return "STRONG BUY"
+                                elif fs >= 70:
+                                    return "WATCH"
+                                else:
+                                    return "LOW"
+
+                            df_interest["Rating"] = df_interest["FinalScore"].apply(classify_rating)
+
+                            # Sort: BUY first, then by FinalScore
+                            df_interest.sort_values(
+                                by=["SignalRank", "FinalScore"],
+                                ascending=[False, False],
+                                inplace=True,
+                            )
+
+                            # Take top N after filters
+                            df_top = df_interest.head(int(screener_limit)).copy()
+
+                            def highlight_screener(row):
+                                if row["Signal"] == "BUY":
+                                    return ["background-color: #c8e6c9"] * len(row)
+                                elif row["Signal"] == "WATCH":
+                                    return ["background-color: #fff9c4"] * len(row)
+                                return [""] * len(row)
+
+                            st.dataframe(
+                                df_top.style.apply(highlight_screener, axis=1).format({
+                                    "Price": "{:.2f}",
+                                    "% From 21D High": "{:.2f}",
+                                    "RSI": "{:.1f}",
+                                    "EMA200": "{:.2f}",
+                                    "QScore": "{:.1f}",
+                                    "MomentumScore": "{:.1f}",
+                                    "DipScore": "{:.1f}",
+                                    "FinalScore": "{:.1f}",
+                                }),
+                                use_container_width=True,
+                                height=600,
+                            )
+
+                            # 📈 Visualize Smart Scores for the top candidate
+                            if not df_top.empty:
+                                top_row = df_top.iloc[0]
+                                with st.expander(f"📊 Smart Score Breakdown – Top Idea: {top_row['Ticker']}", expanded=False):
+                                    st.write(
+                                        f"Sector: **{top_row['Sector']}**, Rating: **{top_row['Rating']}**, "
+                                        f"Signal: **{top_row['Signal']}**"
+                                    )
+                                    score_df = pd.DataFrame({
+                                        "Metric": ["QScore", "MomentumScore", "DipScore", "FinalScore"],
+                                        "Score": [
+                                            top_row["QScore"],
+                                            top_row["MomentumScore"],
+                                            top_row["DipScore"],
+                                            top_row["FinalScore"],
+                                        ],
+                                    }).set_index("Metric")
+
+                                    st.bar_chart(score_df)
+
+                            st.markdown("**✅ Top smart-ranked candidates (with Ratings & Sectors):**")
+                            for _, row in df_top.iterrows():
+                                st.write(
+                                    f"- **{row['Ticker']}** ({row['Sector']}) – {row['Rating']} · {row['Signal']} @ {row['Price']:.2f} | "
+                                    f"Q={row['QScore']:.1f}, M={row['MomentumScore']:.1f}, D={row['DipScore']:.1f}, "
+                                    f"Final={row['FinalScore']:.1f} | "
+                                    f"{row['% From 21D High']:.2f}% from 21D high, RSI={row['RSI']:.1f}"
+                                )
+
+                            # ---- Add-to-universe UX ----
+                            st.markdown("---")
+                            st.markdown("### 📌 Add Screener Ideas to My Universe")
+
+                            available_to_add = df_top["Ticker"].unique().tolist()
+
+                            selected_to_add = st.multiselect(
+                                "Select tickers from this list to add to your personal Signals universe:",
+                                options=available_to_add,
+                            )
+
+                            if st.button("➕ Add selected tickers to My Universe"):
+                                if not selected_to_add:
+                                    st.warning("Select at least one ticker to add.")
+                                else:
+                                    new_names = []
+                                    for t in selected_to_add:
+                                        if t not in tickers:
+                                            tickers.append(t)
+                                            new_names.append(t)
+
+                                    if new_names:
+                                        save_tickers(tickers)
+                                        st.success(
+                                            f"Added to universe: {', '.join(new_names)}. "
+                                            "They will now appear in your main Signals tab and in the Open Positions ticker dropdown."
+                                        )
+                                    else:
+                                        st.info("All selected tickers are already in your universe.")
+
+        except Exception as e:
+            st.error(f"Screener error: {e}")
+    else:
+        st.info("Click **Run Daily Screener (Yahoo)** to see top ideas from the broader universe.")
+
+# ------------- TAB 3: OPEN POSITIONS -------------
 with tab_open:
     st.subheader("Open Positions (You Maintain These)")
 
@@ -932,7 +1596,7 @@ with tab_open:
                 st.success(f"Added position: {ticker_input} ({shares_input} @ {entry_price_input:.2f})")
 
 
-# ------------- TAB 3: MONITOR / CLOSE (YAHOO) -------------
+# ------------- TAB 4: MONITOR / CLOSE (YAHOO) -------------
 with tab_monitor:
     st.subheader("Monitor Open Positions (HOLD / SELL · Yahoo prices)")
 
